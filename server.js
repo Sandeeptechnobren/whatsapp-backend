@@ -1,0 +1,25 @@
+require('dotenv').config();
+const express = require('express');
+const cors = require('cors');
+const usersRouter = require('./routes/users');
+const adminsAuthRouter = require('./routes/admins');
+const instanceRoutes = require("./routes/instance");
+const adminDashboardRouter=require("./routes/adminDashboard");
+const { verifyAdmin } = require("./middleware/auth"); // ✅ import middleware
+
+const PORT = process.env.PORT || 3000;
+const app = express();
+
+app.use(cors());
+app.use(express.json());
+
+app.get('/', (req, res) => res.send('Express + MySQL CRUD API running'));
+
+app.use('/users', usersRouter);
+app.use('/admins', adminsAuthRouter);
+app.use("/instance", instanceRoutes);
+app.use("/dashboard",adminDashboardRouter);
+
+app.listen(PORT, () => {
+  console.log(`Server listening on port ${PORT}`);
+});
