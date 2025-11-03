@@ -135,7 +135,7 @@ exports.loginAdmin = async (req, res) => {
       { expiresIn: "1h" }
     );
     debugLogs.push(`Step 5: JWT token generated`);
-    await db.query("UPDATE admins SET token = ? WHERE id = ?", [token, admin.id]);
+    // await db.query("UPDATE admins SET token = ? WHERE id = ?", [token, admin.id]);
     debugLogs.push("Step 6: Token saved to database");
     debugLogs.push("Step 7: Returning response to client");
     return res.json({
