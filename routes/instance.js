@@ -4,16 +4,17 @@ const controller = require("../controllers/instanceController");
 const { auth } = require("../middleware/auth");
 
 // Routes that require authentication
-router.post("/", auth, controller.createInstance);
-router.get("/list/Instances", auth, controller.listInstances);
-router.post("/:id/webhook", auth, controller.setWebhook);
+router.post("/create", auth, controller.createInstance);
+router.post("/start", auth, controller.startInstance);
+router.get("/list", auth, controller.listInstances);
+router.post("/webhook/:id", auth, controller.setWebhook);
 router.delete("/:id", auth, controller.deleteInstance);
-router.delete("/:id/logout", auth, controller.logoutInstance);
+router.delete("/logout/:id", auth, controller.logoutInstance);
 
 // Routes that are free (no auth required)
-router.get("/:id/qr", controller.getQr);
+router.get("/qr/:id", controller.getQr);
 router.get("/:id/qr.png", controller.getQrPng);
-router.post("/:id/send", controller.sendMessage);
-router.get("/:id/status", controller.getStatus);
+router.post("/send/:id", controller.sendMessage);
+router.get("/status/:id", controller.getStatus);
 
 module.exports = router;

@@ -30,24 +30,24 @@ exports.getAdmin = async (req, res) => {
 exports.createAdmin = async (req, res) => {
   try {
     const { username, password, name, address, email, phone, role } = req.body;
-
     if (!username || !password || !name) {
       return res.status(400).json({ error: 'username, password, and name are required' });
     }
-
     const hashedPassword = await bcrypt.hash(password, 10);
-
-    const [result] = await db.query(
-      `INSERT INTO admins (username, password, name, address, email, phone, role)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      [username, hashedPassword, name, address || null, email || null, phone || null, role || 'admin']
+    const token = jwt.sign(
+      { username, name, role: role || 'admin' },
+      process.env.JWT_SECRET,
+      { expiresIn: '365d' } 
     );
-
+    const [result] = await db.query(
+      `INSERT INTO admins (username, password, name, address, email, phone, role, token)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [username, hashedPassword, name, address || null, email || null, phone || null, role || 'admin',token]
+    );
     const [rows] = await db.query(
       'SELECT id, username, name, address, email, phone, role, token, created_at, updated_at FROM admins WHERE id = ?',
       [result.insertId]
     );
-
     res.status(201).json(rows[0]);
   } catch (err) {
     console.error(err);
