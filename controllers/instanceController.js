@@ -129,6 +129,7 @@ exports.listInstances = async (req, res) => {
 exports.startInstance = async (req, res) => {
   try {
     const { instance_name } = req.body;
+    console.log("Starting instance:", instance_name); 
     const token = req.headers.authorization;
     console.log(token);
     if (!token) return res.status(401).json({ error: "No token provided" });
@@ -207,17 +208,14 @@ exports.createInstance = async (req, res) => {
     const { instance_name } = req.body;
     const token = req.headers.authorization;
     if (!token) return res.status(401).json({ error: "No token provided" });
-
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
     const adminId = decoded.id;
     const instanceToken = crypto.randomBytes(12).toString("hex");
     console.log(adminId, instance_name, instanceToken);
-
     const [result] = await db.query(
       `INSERT INTO instances (admin_id, name, token, status) VALUES (?, ?, ?, 'pending')`,
       [adminId, instance_name, instanceToken]
     );
-
     return res.status(201).json({
       success: true,
       message: `Instance '${instance_name}' registered. QR not generated yet.`,
@@ -229,10 +227,7 @@ exports.createInstance = async (req, res) => {
       },
     });
   } catch (error) {
-    // Log complete error details to the server console for easier debugging
     console.error("Create Instance Error:", error);
-
-    // Respond with error info, safeguarding for SQL vs. general errors
     return res.status(500).json({
       error: error.message,
       sqlMessage: error.sqlMessage || null,
