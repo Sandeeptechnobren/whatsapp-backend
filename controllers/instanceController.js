@@ -147,7 +147,7 @@ exports.startInstance = async (req, res) => {
       return res.status(400).json({ message: "Instance already linked to WhatsApp." });
     }
     const id = instance_name;
-    const client = new Client({ puppeteer: { headless: true } });
+    const client = new Client({ puppeteer: { headless: false } });
     instances[id] = { client, qr: null, ready: false, webhookUrl: null };
     client.on("qr", async (qr) => {
       const [instanceStatusRow] = await db.query(`SELECT status FROM instances WHERE name = ? AND admin_id = ?`, [instance_name, adminId]);
@@ -241,6 +241,7 @@ exports.createInstance = async (req, res) => {
 exports.setWebhook = (req, res) => {
   const id = req.params.id;
   const { webhookUrl } = req.body;
+  console.log(`Setting webhook for instance ${id} to ${webhookUrl}`);
   const instance = instances[id];
   if (!instance) return res.status(404).json({ error: "Instance not found" });
   instance.webhookUrl = webhookUrl || null;
