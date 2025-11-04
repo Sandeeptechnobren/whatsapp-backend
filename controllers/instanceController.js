@@ -30,102 +30,7 @@ exports.listInstances = async (req, res) => {
   }
 };
 
-// exports.createInstance = async (req, res) => {
-//   try {
-//     const { instance_name } = req.body;
-//     const token = req.headers.authorization;
-//     if (!token) return res.status(401).json({ error: "No token provided" });
 
-//     const decoded = jwt.verify(token, process.env.JWT_SECRET);
-//     const adminId = decoded.id;
-//     log("Admin ID from token:", adminId);
-//     // Check if admin exists
-//     const [adminRows] = await db.query(
-//       `SELECT id FROM admins WHERE id = ? AND deleted_at IS NULL`,
-//       [adminId]
-//     );
-//     if (adminRows.length === 0)
-//       return res.status(401).json({ error: "Admin not found" });
-//     const [existing] = await db.query(
-//       `SELECT id FROM instances WHERE name = ? AND admin_id = ? AND deleted_at IS NULL`,
-//       [instance_name, adminId]
-//     );
-//     if (existing.length > 0)
-//       return res.status(400).json({
-//         success: false,
-//         message: "Instance already exists with this name, please use another name!",
-//       });
-//     const instanceToken = crypto.randomBytes(12).toString("hex");
-//     const [result] = await db.query(
-//       `INSERT INTO instances (admin_id, name, token, status) VALUES (?, ?, ?, 'pending')`,
-//       [adminId, instance_name, instanceToken]
-//     );
-//     const id = instance_name;
-//     const client = new Client({
-//       puppeteer: { headless: true },
-//     });
-//     instances[id] = {
-//       client,
-//       qr: null,
-//       ready: false,
-//       webhookUrl: null,
-//     };
-//     client.on("qr", async (qr) => {
-//       console.log(`QR RECEIVED for ${id}`);
-//       instances[id].qr = qr;
-//       await db.query(`UPDATE instances SET qr_code = ?, status = 'pending' WHERE name = ? AND admin_id = ?`, [qr, instance_name, adminId]);
-//     });
-//     client.on("ready", async () => {
-//       console.log(`WhatsApp instance ${id} is ready!`);
-//       instances[id].ready = true;
-//       await db.query(
-//         `UPDATE instances SET status = 'ready', last_seen = NOW() WHERE name = ? AND admin_id = ?`,
-//         [instance_name, adminId]
-//       );
-//     });
-//     client.on("disconnected", async (reason) => {
-//       console.log(`Instance ${id} disconnected: ${reason}`);
-//       delete instances[id];
-//       await db.query(
-//         `UPDATE instances SET status = 'disconnected', last_seen = NOW() WHERE name = ? AND admin_id = ?`,
-//         [instance_name, adminId]
-//       );
-//     });
-//     client.on("message", async (msg) => {
-//       console.log(`New message on instance ${id}:`, msg.body);
-//       const instance = instances[id];
-//       if (instance && instance.webhookUrl) {
-//         try {
-//           await axios.post(instance.webhookUrl, {
-//             instanceId: id,
-//             from: msg.from,
-//             to: msg.to,
-//             body: msg.body,
-//             timestamp: msg.timestamp,
-//             id: msg.id._serialized,
-//           });
-//           console.log(`Webhook sent for instance ${id}`);
-//         } catch (err) {
-//           console.error(`Failed to send webhook for ${id}:`, err.message);
-//         }
-//       }
-//     });
-//     client.initialize();
-//     return res.status(201).json({
-//       success: true,
-//       message: `Instance '${id}' created successfully`,
-//       instance: {
-//         id: result.insertId,
-//         name: instance_name,
-//         token: instanceToken,
-//         status: "pending",
-//       },
-//     });
-//   } catch (error) {
-//     console.error("Error in createInstance:", error);
-//     return res.status(500).json({ error: "Internal server error" });
-//   }
-// };
 exports.startInstance = async (req, res) => {
   try {
     const { instance_name } = req.body;
@@ -147,7 +52,8 @@ exports.startInstance = async (req, res) => {
       return res.status(400).json({ message: "Instance already linked to WhatsApp." });
     }
     const id = instance_name;
-    const client = new Client({ puppeteer: { headless: false } });
+    // const client = new Client({ puppeteer: { headless: true } }); 
+    const client = new Client({puppeteer: {headless: true,args: ['--no-sandbox', '--disable-setuid-sandbox']}});
     instances[id] = { client, qr: null, ready: false, webhookUrl: null };
     client.on("qr", async (qr) => {
       const [instanceStatusRow] = await db.query(`SELECT status FROM instances WHERE name = ? AND admin_id = ?`, [instance_name, adminId]);
