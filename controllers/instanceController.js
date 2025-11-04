@@ -16,11 +16,7 @@ exports.listInstances = async (req, res) => {
     const adminId = decoded.id;
 
     const [rows] = await db.query(
-      `SELECT id, name, token, status
-       FROM instances 
-       WHERE admin_id = ? AND deleted_at IS NULL
-       ORDER BY id DESC`,
-      [adminId]
+      `SELECT id, name, token, status FROM instances WHERE admin_id = ? AND deleted_at IS NULL ORDER BY id DESC`,[adminId]
     );
     return res.json({
       success: true,
@@ -180,18 +176,48 @@ exports.startInstance = async (req, res) => {
   }
 };
 
+// exports.createInstance = async (req, res) => {
+//   try {
+//     const { instance_name } = req.body;
+//     const token = req.headers.authorization;
+//     if (!token) return res.status(401).json({ error: "No token provided" });
+//     const decoded = jwt.verify(token, process.env.JWT_SECRET);
+//     const adminId = decoded.id;
+//     const instanceToken = crypto.randomBytes(12).toString("hex");
+//     console.log(adminId, instance_name, instanceToken);
+//     const [result] = await db.query(
+//       `INSERT INTO instances(admin_id, name, token, status) VALUES (?, ?, ?, 'pending')`,
+//       [adminId, instance_name, instanceToken]
+//     );
+//     return res.status(201).json({
+//       success: true,
+//       message: `Instance '${instance_name}' registered. QR not generated yet.`,
+//       instance: {
+//         id: result.insertId,
+//         name: instance_name,
+//         token: instanceToken,
+//         status: "pending",
+//       },
+//     });
+//   } catch (error) {
+//   }
+// };
 exports.createInstance = async (req, res) => {
   try {
     const { instance_name } = req.body;
     const token = req.headers.authorization;
     if (!token) return res.status(401).json({ error: "No token provided" });
+
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
     const adminId = decoded.id;
     const instanceToken = crypto.randomBytes(12).toString("hex");
+    console.log(adminId, instance_name, instanceToken);
+
     const [result] = await db.query(
       `INSERT INTO instances (admin_id, name, token, status) VALUES (?, ?, ?, 'pending')`,
       [adminId, instance_name, instanceToken]
     );
+
     return res.status(201).json({
       success: true,
       message: `Instance '${instance_name}' registered. QR not generated yet.`,
@@ -203,6 +229,16 @@ exports.createInstance = async (req, res) => {
       },
     });
   } catch (error) {
+    // Log complete error details to the server console for easier debugging
+    console.error("Create Instance Error:", error);
+
+    // Respond with error info, safeguarding for SQL vs. general errors
+    return res.status(500).json({
+      error: error.message,
+      sqlMessage: error.sqlMessage || null,
+      code: error.code || null,
+      stack: process.env.NODE_ENV !== 'production' ? error.stack : undefined // Show stack only in dev
+    });
   }
 };
 
