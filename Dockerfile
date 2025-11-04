@@ -19,12 +19,12 @@ RUN apt-get update && apt-get install -y \
   libxdamage1 \
   libxrandr2 \
   xdg-utils \
-  libgobject-2.0-0 \
   libglib2.0-0 \
   libpango-1.0-0 \
   libxshmfence1 \
   libxss1 \
   --no-install-recommends
+
 
 # Clean up (optional but saves space)
 RUN rm -rf /var/lib/apt/lists/*
