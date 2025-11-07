@@ -1,6 +1,7 @@
 const db = require('../db');
 const bcrypt = require('bcrypt');
 const jwt = require("jsonwebtoken");
+const crypto = require('crypto');
 exports.listAdmins = async (req, res) => {
   try {
     const [rows] = await db.query(
@@ -27,32 +28,83 @@ exports.getAdmin = async (req, res) => {
   }
 };
 
+// exports.createAdmin = async (req, res) => {
+//   try {
+//     const { username, password, name, address, email, phone, role } = req.body;
+//     if (!username || !password || !name) {
+//       return res.status(400).json({ error: 'username, password, and name are required' });
+//     }
+//     const hashedPassword = await bcrypt.hash(password, 10);
+//     const token = jwt.sign(
+//       { username, name, role: role || 'admin' },
+//       process.env.JWT_SECRET,
+//       { expiresIn: '365d' } 
+//     );
+//     const [result] = await db.query(
+//       `INSERT INTO admins (username, password, name, address, email, phone, role, token)
+//        VALUES (?, ?, ?, ?, ?, ?, ?)`,
+//       [username, hashedPassword, name, address || null, email || null, phone || null, role || 'admin',token]
+//     );
+//     const [rows] = await db.query(
+//       'SELECT id, username, name, address, email, phone, role, token, created_at, updated_at FROM admins WHERE id = ?',
+//       [result.insertId]
+//     );
+//     res.status(201).json(rows[0]);
+//   } catch (err) {
+//     console.error(err);
+//     if (err.code === 'ER_DUP_ENTRY') return res.status(400).json({ error: 'Duplicate entry: username/email already exists' });
+//     res.status(500).json({ error: 'Database error' });
+//   }
+// };
+
+
+
 exports.createAdmin = async (req, res) => {
   try {
     const { username, password, name, address, email, phone, role } = req.body;
-    if (!username || !password || !name) {
-      return res.status(400).json({ error: 'username, password, and name are required' });
+    if (!username?.trim() || !password || !name?.trim()) {
+      return res.status(400).json({
+        error: 'Username, password, and name are required',
+      });
     }
     const hashedPassword = await bcrypt.hash(password, 10);
-    const token = jwt.sign(
-      { username, name, role: role || 'admin' },
-      process.env.JWT_SECRET,
-      { expiresIn: '365d' } 
-    );
+    const randomToken = crypto.randomBytes(30).toString('hex');
+    const userData = [
+      username.trim(),
+      hashedPassword,
+      name.trim(),
+      address?.trim() || null,
+      email?.trim() || null,
+      phone?.trim() || null,
+      role || 'admin',
+      randomToken,
+    ];
     const [result] = await db.query(
-      `INSERT INTO admins (username, password, name, address, email, phone, role, token)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      [username, hashedPassword, name, address || null, email || null, phone || null, role || 'admin',token]
+      `INSERT INTO admins 
+        (username, password, name, address, email, phone, role, token)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      userData
     );
     const [rows] = await db.query(
-      'SELECT id, username, name, address, email, phone, role, token, created_at, updated_at FROM admins WHERE id = ?',
+      `SELECT id, username, name, address, email, phone, role, token, created_at, updated_at 
+       FROM admins WHERE id = ?`,
       [result.insertId]
     );
-    res.status(201).json(rows[0]);
+    return res.status(201).json({
+      success: true,
+      message: 'Admin created successfully',
+      admin: rows[0],
+    });
   } catch (err) {
-    console.error(err);
-    if (err.code === 'ER_DUP_ENTRY') return res.status(400).json({ error: 'Duplicate entry: username/email already exists' });
-    res.status(500).json({ error: 'Database error' });
+    console.error('Create Admin Error:', err);
+    if (err.code === 'ER_DUP_ENTRY') {
+      return res.status(400).json({
+        error: 'Duplicate entry: username or email already exists',
+      });
+    }
+    return res.status(500).json({
+      error: 'Internal Server Error',
+    });
   }
 };
 

@@ -80,7 +80,9 @@ exports.startInstance = async (req, res) => {
     client.initialize();
     res.status(200).json({ success: true, message: "Instance started, QR will be generated if not already linked." });
   } catch (error) {
-  }
+  console.error(error);
+  res.status(500).json({ error: error.message, stack: error.stack });
+}
 };
 
 // exports.createInstance = async (req, res) => {
@@ -196,7 +198,6 @@ exports.sendMessage = async (req, res) => {
   const instance = instances[id];
   if (!instance) return res.status(404).json({ error: "Instance not found" });
   if (!instance.ready) return res.status(400).json({ error: "Instance not ready" });
-
   try {
     const chatId = number.includes("@c.us") ? number : `${number}@c.us`;
     await instance.client.sendMessage(chatId, message);
