@@ -26,7 +26,14 @@ router.post("/login", (req, res) => {
             process.env.JWT_SECRET,
             { expiresIn: "1h" }
         );
-        return res.json({ token });
+        return res.json({
+            id: admin.id,
+            name: admin.name,
+            email: admin.email,
+            role: admin.role,
+            adminToken: admin.token,
+            token: token
+        });
     });
 });
 

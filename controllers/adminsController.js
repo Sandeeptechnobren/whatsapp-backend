@@ -60,6 +60,7 @@ exports.getAdmin = async (req, res) => {
 
 
 exports.createAdmin = async (req, res) => {
+  console.log("Create Admin Request Body:", req.body);
   try {
     const { username, password, name, address, email, phone, role } = req.body;
     if (!username?.trim() || !password || !name?.trim()) {
@@ -157,28 +158,17 @@ exports.loginAdmin = async (req, res) => {
   try {
     const { username, password } = req.body;
 
-    debugLogs.push("Step 1: Received login request");
-    debugLogs.push(`Username: ${username}`);
-    debugLogs.push(`Password provided: ${password ? "Yes" : "No"}`);
-
     if (!username || !password) {
       debugLogs.push("Step 2: Missing username or password");
       return res.status(400).json({ error: "Username and password are required", debugLogs });
     }
     const [rows] = await db.query("SELECT * FROM admins WHERE username = ?", [username]);
-    debugLogs.push(`Step 3: DB query result: ${rows.length} record(s) found`);
-
     if (!rows.length) {
-      debugLogs.push("Step 3: No admin found with this username");
       return res.status(401).json({ error: "Invalid username or password", debugLogs });
     }
-
     const admin = rows[0];
     const isMatch = await bcrypt.compare(password, admin.password);
-    debugLogs.push(`Step 4: Password match: ${isMatch}`);
-
     if (!isMatch) {
-      debugLogs.push("Step 4: Password incorrect");
       return res.status(401).json({ error: "Invalid username or password", debugLogs });
     }
     const token = jwt.sign(
@@ -186,10 +176,6 @@ exports.loginAdmin = async (req, res) => {
       process.env.JWT_SECRET,
       { expiresIn: "1h" }
     );
-    debugLogs.push(`Step 5: JWT token generated`);
-    // await db.query("UPDATE admins SET token = ? WHERE id = ?", [token, admin.id]);
-    debugLogs.push("Step 6: Token saved to database");
-    debugLogs.push("Step 7: Returning response to client");
     return res.json({
       success: true,
       admin: {
@@ -197,6 +183,7 @@ exports.loginAdmin = async (req, res) => {
         username: admin.username,
         name: admin.name,
         role: admin.role,
+        adminToken:admin.token,
         token,
       },
       debugLogs
