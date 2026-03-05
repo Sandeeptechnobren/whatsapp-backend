@@ -1,3 +1,2 @@
-2026/02/14-18:00:23.501 2b6c Reusing MANIFEST D:\whatsapp\backend\.wwebjs_auth\session-new\Default\Service Worker\Database/MANIFEST-000001
-2026/02/14-18:00:23.501 2b6c Recovering log #3
-2026/02/14-18:00:23.501 2b6c Reusing old log D:\whatsapp\backend\.wwebjs_auth\session-new\Default\Service Worker\Database/000003.log 
+2026/03/05-21:46:02.645 28b4 Creating DB D:\whatsapp\backend\.wwebjs_auth\session-new\Default\Service Worker\Database since it was missing.
+2026/03/05-21:46:02.679 28b4 Reusing MANIFEST D:\whatsapp\backend\.wwebjs_auth\session-new\Default\Service Worker\Database/MANIFEST-000001
