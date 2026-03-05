@@ -1,7 +1,8 @@
-const { Client } = require("whatsapp-web.js");
+const { Client ,LocalAuth} = require("whatsapp-web.js");
 const qrcode = require("qrcode");
 const db = require("../db");
 const crypto = require("crypto");
+
 
 let instances = {};
 
@@ -322,24 +323,34 @@ exports.getQrPng = async (req, res) => {
     res.status(500).json({ error: "Failed to generate QR code" });
   }
 };
-exports.connectInstance = async (req, res, instance_name) => {
+exports.connectInstance = async (req, res) => {
   try {
     const { token } = req.body;
-    // const instance_name = req.params.name;
+    const instance_name = req.params.instance_name;
 
+    /* ===============================
+       🔐 Validate Admin
+    =============================== */
     const admin = await getAdminFromToken(token);
-    if (!admin) return res.status(401).json({ error: "Invalid token" });
+    if (!admin) {
+      return res.status(401).json({ error: "Invalid token" });
+    }
 
+    /* ===============================
+       🔍 Check Instance Exists
+    =============================== */
     const [rows] = await db.query(
       `SELECT * FROM instances 
        WHERE name = ? AND admin_id = ? AND deleted_at IS NULL`,
       [instance_name, admin.id]
     );
 
-    if (!rows.length)
+    if (!rows.length) {
       return res.status(404).json({ error: "Instance not found" });
+    }
 
     const dbInstance = rows[0];
+
     if (dbInstance.status === "ready") {
       return res.status(400).json({ error: "Already connected" });
     }
@@ -348,7 +359,13 @@ exports.connectInstance = async (req, res, instance_name) => {
       return res.status(400).json({ error: "Instance already initializing" });
     }
 
+    /* ===============================
+       🚀 Create WhatsApp Client
+    =============================== */
     const client = new Client({
+      authStrategy: new LocalAuth({
+        clientId: instance_name, // 🔥 Persist session per instance
+      }),
       puppeteer: {
         headless: true,
         args: ["--no-sandbox", "--disable-setuid-sandbox"],
@@ -360,51 +377,98 @@ exports.connectInstance = async (req, res, instance_name) => {
       ready: false,
     };
 
-    client.on("qr", async (qr) => {
+    /* ===============================
+       📌 WAIT FOR QR (SAFE PROMISE)
+    =============================== */
+    const qrPromise = new Promise((resolve, reject) => {
+      let resolved = false;
+
+      client.on("qr", async (qr) => {
+        try {
+          if (resolved) return;
+          resolved = true;
+
+          const qrBuffer = await qrcode.toBuffer(qr, { type: "png" });
+
+          // 🔥 ALWAYS STORE STRING
+          await db.query(
+            `UPDATE instances 
+             SET status = 'pending', qr_code = ?
+             WHERE name = ? AND admin_id = ?`,
+            [qr.toString(), instance_name, admin.id]
+          );
+
+          resolve(qrBuffer);
+        } catch (err) {
+          reject(err);
+        }
+      });
+    });
+
+    /* ===============================
+       ✅ READY EVENT
+    =============================== */
+    client.on("ready", async () => {
       try {
-        const qrBuffer = await qrcode.toBuffer(qr, { type: "png" });
+        instances[instance_name].ready = true;
 
         await db.query(
           `UPDATE instances 
-           SET status = 'pending', qr_code = ? 
+           SET status = 'ready', qr_code = NULL, last_seen = NOW()
            WHERE name = ? AND admin_id = ?`,
-          [qr, instance_name, admin.id]
+          [instance_name, admin.id]
         );
-
-        res.setHeader("Content-Type", "image/png");
-        return res.send(qrBuffer);
       } catch (err) {
-        return res.status(500).json({ error: "QR generation failed" });
+        console.error("DB update error (ready):", err);
       }
     });
 
-    client.on("ready", async () => {
-      instances[instance_name].ready = true;
-
-      await db.query(
-        `UPDATE instances 
-         SET status = 'ready', qr_code = NULL, last_seen = NOW()
-         WHERE name = ? AND admin_id = ?`,
-        [instance_name, admin.id]
-      );
-    });
-
+    /* ===============================
+       🔌 DISCONNECTED EVENT
+    =============================== */
     client.on("disconnected", async () => {
-      delete instances[instance_name];
+      try {
+        delete instances[instance_name];
 
-      await db.query(
-        `UPDATE instances 
-         SET status = 'pending', last_seen = NOW()
-         WHERE name = ? AND admin_id = ?`,
-        [instance_name, admin.id]
-      );
+        await db.query(
+          `UPDATE instances 
+           SET status = 'pending', last_seen = NOW()
+           WHERE name = ? AND admin_id = ?`,
+          [instance_name, admin.id]
+        );
+      } catch (err) {
+        console.error("DB update error (disconnect):", err);
+      }
     });
 
-    client.initialize();
+    /* ===============================
+       ❌ CLIENT ERROR HANDLING
+    =============================== */
+    client.on("auth_failure", (msg) => {
+      console.error("Auth failure:", msg);
+    });
+
+    client.on("error", (err) => {
+      console.error("Client error:", err);
+    });
+
+    /* ===============================
+       🔄 Initialize Client
+    =============================== */
+    await client.initialize();
+
+    /* ===============================
+       📤 Wait for QR
+    =============================== */
+    const qrBuffer = await qrPromise;
+
+    res.setHeader("Content-Type", "image/png");
+    return res.send(qrBuffer);
 
   } catch (error) {
     console.error("Connect Instance Error:", error);
-    res.status(500).json({ error: error.message });
+    return res.status(500).json({ error: error.message });
   }
 };
+
 
