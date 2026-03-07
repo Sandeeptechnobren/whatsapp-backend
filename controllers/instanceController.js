@@ -6,19 +6,18 @@ const axios   = require("axios");
 const path    = require("path");
 const fs      = require("fs").promises;
 
-/* ============================================================
-   In-memory map of running WhatsApp clients
-   key = instance name, value = { client, ready, qr, webhookUrl }
-   ============================================================ */
 let instances = {};
 
-/* ------------------------------------------------------------------ */
-/*  Helpers                                                             */
-/* ------------------------------------------------------------------ */
 async function getAdminFromToken(token) {
     if (!token) return null;
     const [rows] = await db.query("SELECT * FROM admins WHERE token = ?", [token]);
     return rows.length ? rows[0] : null;
+}
+
+function setNoCacheHeaders(res) {
+    res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+    res.setHeader("Pragma", "no-cache");
+    res.setHeader("Expires", "0");
 }
 
 async function forwardToWebhook(webhookUrl, event, instanceName, data) {
@@ -30,42 +29,83 @@ async function forwardToWebhook(webhookUrl, event, instanceName, data) {
     }
 }
 
-/** Safely destroy a WhatsApp client, release file locks, clean session on Windows */
 async function safeDestroyClient(client, instanceName) {
-    // Step 1: destroy the browser (releases file locks on Windows)
-    try { await client.destroy(); } catch (e) { /* ignore */ }
+    try { await client.destroy(); } catch (_) { /* ignore */ }
 
-    // Step 2: on Windows EBUSY, wait a moment then force-delete session dir
-    await new Promise(r => setTimeout(r, 1500));
+    // Step 2: wait for Windows to release file handles on Chromium's SQLite files
+    await new Promise(r => setTimeout(r, 2000));
 
+    // Step 3: retry deleting session dir with backoff (handles Windows EBUSY)
     const sessionDir = path.join(process.cwd(), ".wwebjs_auth", `session-${instanceName}`);
-    try {
-        await fs.rm(sessionDir, { recursive: true, force: true });
-    } catch (_) { /* ignore if already gone */ }
+    for (let attempt = 1; attempt <= 5; attempt++) {
+        try {
+            await fs.rm(sessionDir, { recursive: true, force: true });
+            return; // success
+        } catch (_) {
+            if (attempt < 5) await new Promise(r => setTimeout(r, attempt * 1000));
+        }
+    }
+    console.warn(`[${instanceName}] Could not fully clean session dir — will be cleaned on next startup`);
 }
 
 /** Attach all standard event handlers to a WhatsApp client */
 function attachClientEvents(client, instanceName, adminId) {
     client.on("ready", async () => {
         try {
+            if (!instances[instanceName]) return; // guard: instance may have been removed
+            // whatsapp-web.js can fire 'ready' multiple times during injection retries —
+            // only process the first one
+            if (instances[instanceName].ready) return;
             instances[instanceName].ready = true;
+            instances[instanceName].qr = null;
             await db.query(
                 "UPDATE instances SET status='ready', qr_code=NULL, last_seen=NOW() WHERE name=? AND admin_id=?",
                 [instanceName, adminId]
             );
             const wh = instances[instanceName]?.webhookUrl;
             if (wh) forwardToWebhook(wh, "session.connected", instanceName, { instance: instanceName });
-        } catch (err) { console.error("ready event DB error:", err.message); }
+            console.log(`[${instanceName}] Connected and ready`);
+        } catch (err) { console.error(`[${instanceName}] ready event error:`, err.message); }
     });
 
     client.on("disconnected", async (reason) => {
+        console.log(`[${instanceName}] Disconnected: ${reason}`);
+        // Guard: if already cleaned up (e.g. logoutInstance deleted the entry first),
+        // skip all further processing to prevent duplicate DB writes and false reconnects.
+        if (!instances[instanceName]) return;
+        const webhookUrl = instances[instanceName]?.webhookUrl || null;
+        delete instances[instanceName];
+
+        // BUG FIX 1: Destroy the Chromium browser immediately after removing the instance
+        // from the map. Without this, the process stays alive and keeps a WhatsApp Web
+        // session open. When autoReconnect creates a new client seconds later with the
+        // same LocalAuth session, WhatsApp detects two simultaneous connections and fires
+        // LOGOUT on both — causing the "Connected and ready → Disconnected: LOGOUT" loop.
+        client.destroy().catch(() => {});
+
         try {
-            delete instances[instanceName];
             await db.query(
-                "UPDATE instances SET status='pending', last_seen=NOW() WHERE name=? AND admin_id=?",
+                "UPDATE instances SET status='disconnected', last_seen=NOW() WHERE name=? AND admin_id=?",
                 [instanceName, adminId]
             );
-        } catch (err) { console.error("disconnected event DB error:", err.message); }
+        } catch (err) { console.error(`[${instanceName}] disconnect DB error:`, err.message); }
+
+        // BUG FIX 2: When WhatsApp fires LOGOUT the session has been revoked on the
+        // server side (user removed the linked device from their phone, or too many
+        // devices). Delete the local session directory so restoreActiveSessions doesn't
+        // reload a dead session on the next restart, which would produce another instant
+        // "ready → LOGOUT" cycle.
+        if (reason === "LOGOUT") {
+            const sessionDir = path.join(process.cwd(), ".wwebjs_auth", `session-${instanceName}`);
+            fs.rm(sessionDir, { recursive: true, force: true }).catch(() => {});
+            console.log(`[${instanceName}] Session directory removed (LOGOUT — session revoked)`);
+        }
+
+        // Auto-reconnect unless the user explicitly logged out or there's a conflict
+        if (reason !== "LOGOUT" && reason !== "CONFLICT") {
+            console.log(`[${instanceName}] Will auto-reconnect in 5s (reason: ${reason})`);
+            setTimeout(() => autoReconnect(instanceName, adminId, webhookUrl), 5000);
+        }
     });
 
     client.on("message", async (msg) => {
@@ -83,7 +123,7 @@ function attachClientEvents(client, instanceName, adminId) {
                     hasMedia: msg.hasMedia,
                 });
             }
-        } catch (err) { console.error("message event error:", err.message); }
+        } catch (err) { console.error(`[${instanceName}] message event error:`, err.message); }
     });
 
     client.on("message_ack", async (msg, ack) => {
@@ -91,9 +131,150 @@ function attachClientEvents(client, instanceName, adminId) {
         if (wh) forwardToWebhook(wh, "message.ack", instanceName, { id: msg.id, ack });
     });
 
-    client.on("auth_failure", (msg) => console.error(`[${instanceName}] Auth failure:`, msg));
+    // Keep instances[name].qr up to date on every QR rotation so getQrPng always
+    // returns the latest code — critical for restored/auto-reconnected sessions
+    client.on("qr", async (qr) => {
+        if (!instances[instanceName]) return;
+        instances[instanceName].qr = qr;
+        instances[instanceName].ready = false;
+        await db.query(
+            "UPDATE instances SET status='pending', qr_code=? WHERE name=? AND admin_id=?",
+            [qr.toString(), instanceName, adminId]
+        ).catch(() => {});
+        console.log(`[${instanceName}] QR updated`);
+    });
+
+    client.on("auth_failure", async (msg) => {
+        console.error(`[${instanceName}] Auth failure:`, msg);
+        if (instances[instanceName]) delete instances[instanceName];
+        // Destroy browser and remove the invalid session so it is not restored on restart
+        client.destroy().catch(() => {});
+        const sessionDir = path.join(process.cwd(), ".wwebjs_auth", `session-${instanceName}`);
+        fs.rm(sessionDir, { recursive: true, force: true }).catch(() => {});
+        db.query("UPDATE instances SET status='disconnected' WHERE name=? AND admin_id=?", [instanceName, adminId]).catch(() => {});
+    });
+
     client.on("error", (err) => console.error(`[${instanceName}] Client error:`, err.message));
 }
+
+function createClient(instanceName) {
+    const client = new Client({
+        authStrategy: new LocalAuth({ clientId: instanceName }),
+        puppeteer: {
+            headless: true,
+            args: [
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--no-first-run",
+                "--no-zygote",
+                // Prevent WhatsApp Web from detecting headless Chrome as an automated
+                // browser, which causes it to revoke the session immediately after
+                // authentication (ready → LOGOUT within seconds).
+                "--disable-blink-features=AutomationControlled",
+            ],
+        },
+        // Pin to a locally cached WhatsApp Web version rather than always fetching
+        // the latest. WhatsApp pushes updates frequently and newer versions can be
+        // incompatible with the current whatsapp-web.js injection until a library
+        // patch is released. With 'local', once a working version is cached it stays
+        // pinned; delete .wwebjs_cache to force a fresh download.
+        webVersionCache: {
+            type: "local",
+            path: "./.wwebjs_cache",
+        },
+    });
+
+    // LocalAuth.logout() calls fs.promises.rm() while Chromium still holds file handles
+    // open on Windows → EBUSY. This wrapper swallows that error so it never becomes an
+    // unhandledRejection. The original function is still called so fresh-session cleanup
+    // works when it can; safeDestroyClient handles the retry after the browser closes.
+    const _origLogout = client.authStrategy.logout.bind(client.authStrategy);
+    client.authStrategy.logout = async () => { try { await _origLogout(); } catch (_) {} };
+
+    return client;
+}
+
+// Tracks instances currently in the middle of an auto-reconnect attempt
+const reconnecting = new Set();
+
+/** Auto-reconnect an instance after an unexpected disconnect */
+async function autoReconnect(instanceName, adminId, webhookUrl) {
+    if (instances[instanceName]) return; // already back online
+    if (reconnecting.has(instanceName)) return; // another reconnect is already in progress
+
+    // Check session dir exists before trying to reconnect
+    const sessionDir = path.join(process.cwd(), ".wwebjs_auth", `session-${instanceName}`);
+    try { await fs.access(sessionDir); } catch { return; } // session was deleted (explicit logout)
+
+    // Verify instance still exists in DB and isn't deleted
+    try {
+        const [rows] = await db.query(
+            "SELECT id FROM instances WHERE name=? AND admin_id=? AND deleted_at IS NULL",
+            [instanceName, adminId]
+        );
+        if (!rows.length) return;
+    } catch { return; }
+
+    reconnecting.add(instanceName);
+    console.log(`[${instanceName}] Auto-reconnecting...`);
+    try {
+        const client = createClient(instanceName);
+        instances[instanceName] = { client, ready: false, qr: null, webhookUrl: webhookUrl || null };
+        attachClientEvents(client, instanceName, adminId);
+        client.initialize().catch(err => {
+            console.error(`[${instanceName}] Auto-reconnect init error:`, err.message);
+            delete instances[instanceName];
+        });
+    } finally {
+        reconnecting.delete(instanceName);
+    }
+}
+
+/**
+ * On server startup: restore WhatsApp sessions for all instances that have a
+ * saved LocalAuth session directory. This keeps users logged in across restarts.
+ */
+async function restoreActiveSessions() {
+    const baseDir = path.join(process.cwd(), ".wwebjs_auth");
+    let entries;
+    try {
+        entries = await fs.readdir(baseDir);
+    } catch {
+        return; // no session dir yet — nothing to restore
+    }
+
+    for (const entry of entries) {
+        if (!entry.startsWith("session-")) continue;
+        const instanceName = entry.slice("session-".length);
+        if (instances[instanceName]) continue; // already initializing
+
+        try {
+            const [rows] = await db.query(
+                "SELECT admin_id, webhook_url FROM instances WHERE name=? AND deleted_at IS NULL LIMIT 1",
+                [instanceName]
+            );
+            if (!rows.length) continue;
+
+            const { admin_id, webhook_url } = rows[0];
+            console.log(`[${instanceName}] Restoring saved session...`);
+
+            const client = createClient(instanceName);
+            instances[instanceName] = { client, ready: false, qr: null, webhookUrl: webhook_url || null };
+
+            attachClientEvents(client, instanceName, admin_id);
+            client.initialize().catch(err => {
+                console.error(`[${instanceName}] Session restore init error:`, err.message);
+                delete instances[instanceName];
+            });
+        } catch (err) {
+            console.error(`[${instanceName}] Session restore error:`, err.message);
+        }
+    }
+}
+
+exports.restoreActiveSessions = restoreActiveSessions;
 
 /* ============================================================
    INSTANCE MANAGEMENT
@@ -189,56 +370,24 @@ exports.connectInstance = async (req, res) => {
         );
         if (!rows.length) return res.status(404).json({ error: "Instance not found" });
 
-        if (instances[instance_name])
-            return res.status(400).json({ error: "Instance is already initializing or connected" });
-
-        const client = new Client({
-            authStrategy: new LocalAuth({ clientId: instance_name }),
-            puppeteer: {
-                headless: true,
-                args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
-            },
-        });
-
-        instances[instance_name] = { client, ready: false, qr: null, webhookUrl: null };
-
-        // Restore saved webhook
-        if (rows[0].webhook_url) instances[instance_name].webhookUrl = rows[0].webhook_url;
-
-        /* QR or already-ready race */
-        const resolveEvent = new Promise((resolve, reject) => {
-            const timeout = setTimeout(() => reject(new Error("QR generation timed out (60s)")), 60000);
-
-            client.on("qr", async (qr) => {
-                clearTimeout(timeout);
-                instances[instance_name].qr = qr;
-                try {
-                    const buf = await qrcode.toBuffer(qr, { type: "png" });
-                    await db.query(
-                        "UPDATE instances SET status='pending', qr_code=? WHERE name=? AND admin_id=?",
-                        [qr.toString(), instance_name, admin.id]
-                    );
-                    resolve({ type: "qr", buf });
-                } catch (e) { reject(e); }
-            });
-
-            client.on("ready", () => {
-                clearTimeout(timeout);
-                resolve({ type: "ready" });
-            });
-        });
-
-        attachClientEvents(client, instance_name, admin.id);
-        client.initialize().catch(err => console.error(`[${instance_name}] init error:`, err.message));
-
-        const result = await resolveEvent;
-
-        if (result.type === "ready") {
-            return res.json({ success: true, status: "ready", message: "Already authenticated" });
+        // Report current in-memory state without blocking
+        if (instances[instance_name]) {
+            const inst = instances[instance_name];
+            if (inst.ready) return res.json({ success: true, status: "ready" });
+            if (inst.qr)    return res.json({ success: true, status: "pending" });
+            return res.json({ success: true, status: "initializing" });
         }
 
-        res.setHeader("Content-Type", "image/png");
-        return res.send(result.buf);
+        // Start client initialization in the background — respond immediately
+        const client = createClient(instance_name);
+        instances[instance_name] = { client, ready: false, qr: null, webhookUrl: rows[0].webhook_url || null };
+        attachClientEvents(client, instance_name, admin.id);
+        client.initialize().catch(err => {
+            console.error(`[${instance_name}] init error:`, err.message);
+            delete instances[instance_name];
+        });
+
+        return res.json({ success: true, status: "initializing" });
 
     } catch (error) {
         console.error("connectInstance error:", error);
@@ -260,13 +409,11 @@ exports.startInstance = async (req, res) => {
         if (!rows.length) return res.status(404).json({ error: "Instance not found" });
         if (instances[instance_name]) return res.status(400).json({ message: "Already running" });
 
-        const client = new Client({
-            puppeteer: { headless: true, args: ["--no-sandbox", "--disable-setuid-sandbox"] },
-        });
-
+        const client = createClient(instance_name);
         instances[instance_name] = { client, ready: false, qr: null, webhookUrl: rows[0].webhook_url || null };
 
         client.on("qr", async (qr) => {
+            if (!instances[instance_name]) return; // guard
             instances[instance_name].qr = qr;
             await db.query(
                 "UPDATE instances SET qr_code=?, status='pending' WHERE name=? AND admin_id=?",
@@ -319,19 +466,18 @@ exports.logoutInstance = async (req, res) => {
         const instance = instances[id];
         if (!instance) return res.status(404).json({ error: "Instance not in memory (may be offline)" });
 
-        // Step 1: try graceful logout (sends signal to WhatsApp servers)
-        try {
-            await Promise.race([
-                instance.client.logout(),
-                new Promise((_, reject) => setTimeout(() => reject(new Error("logout timeout")), 8000)),
-            ]);
-        } catch (e) {
-            console.warn(`[${id}] logout signal failed:`, e.message);
-            // Step 2: force destroy to release file locks (EBUSY fix)
-            await safeDestroyClient(instance.client, id);
-        }
-
+        // Remove from map FIRST so the 'disconnected' event handler sees no entry
+        // and exits immediately — prevents the double-LOGOUT / double-cleanup problem.
         delete instances[id];
+
+        // Send the WhatsApp logout signal via Puppeteer (best-effort, 3s timeout).
+        const signalPromise = (instance.client.pupPage?.evaluate(
+            () => window.Store?.AppState?.logout?.()
+        ) ?? Promise.resolve()).catch(() => {});
+        await Promise.race([signalPromise, new Promise(resolve => setTimeout(resolve, 3000))]);
+
+        // Destroy browser + clean session files with retry backoff (safe on Windows)
+        await safeDestroyClient(instance.client, id);
 
         await db.query(
             "UPDATE instances SET status='pending', last_seen=NOW() WHERE name=? AND admin_id=?",
@@ -394,6 +540,7 @@ exports.getQrPng = async (req, res) => {
     try {
         const buf = await qrcode.toBuffer(instance.qr, { type: "png" });
         res.setHeader("Content-Type", "image/png");
+        setNoCacheHeaders(res);
         return res.send(buf);
     } catch (err) {
         return res.status(500).json({ error: err.message });
