@@ -158,23 +158,39 @@ function attachClientEvents(client, instanceName, adminId) {
 }
 
 function createClient(instanceName) {
+    const puppeteerConfig = {
+        headless: true,
+        args: [
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+            "--no-first-run",
+            "--no-zygote",
+            // Prevent WhatsApp Web from detecting headless Chrome as an automated
+            // browser, which causes it to revoke the session immediately after
+            // authentication (ready → LOGOUT within seconds).
+            "--disable-blink-features=AutomationControlled",
+        ],
+    };
+
+    // On Linux servers (Render, Railway, etc.) use the system-installed Chromium
+    // so Puppeteer doesn't try to download its own bundled Chrome binary.
+    if (process.platform === "linux") {
+        const chromePaths = [
+            "/usr/bin/chromium-browser",
+            "/usr/bin/chromium",
+            "/usr/bin/google-chrome",
+            "/usr/bin/google-chrome-stable",
+        ];
+        const fs_sync = require("fs");
+        const systemChrome = chromePaths.find(p => { try { fs_sync.accessSync(p); return true; } catch { return false; } });
+        if (systemChrome) puppeteerConfig.executablePath = systemChrome;
+    }
+
     const client = new Client({
         authStrategy: new LocalAuth({ clientId: instanceName }),
-        puppeteer: {
-            headless: true,
-            args: [
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--no-first-run",
-                "--no-zygote",
-                // Prevent WhatsApp Web from detecting headless Chrome as an automated
-                // browser, which causes it to revoke the session immediately after
-                // authentication (ready → LOGOUT within seconds).
-                "--disable-blink-features=AutomationControlled",
-            ],
-        },
+        puppeteer: puppeteerConfig,
         // Pin to a locally cached WhatsApp Web version rather than always fetching
         // the latest. WhatsApp pushes updates frequently and newer versions can be
         // incompatible with the current whatsapp-web.js injection until a library
