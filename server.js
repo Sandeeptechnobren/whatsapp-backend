@@ -16,6 +16,7 @@ const instanceRoutes     = require("./routes/instance");
 const adminDashRouter    = require("./routes/adminDashboard");
 const paymentsRouter     = require("./routes/payments");
 const superadminRouter   = require("./routes/superadmin");
+const settingsRouter     = require("./routes/settings");
 const { restoreActiveSessions } = require("./controllers/instanceController");
 
 const PORT = process.env.PORT || 3000;
@@ -35,6 +36,7 @@ app.use("/instance",   instanceRoutes);
 app.use("/dashboard",  adminDashRouter);
 app.use("/payments",   paymentsRouter);
 app.use("/superadmin", superadminRouter);
+app.use("/settings",   settingsRouter);
 
 /* Global error handler */
 app.use((err, req, res, next) => {
@@ -53,10 +55,9 @@ app.listen(PORT, async () => {
         console.error("Startup reset error:", err.message);
     }
 
-    // Restore saved WhatsApp sessions from disk so users stay logged in across restarts
-    try {
-        await restoreActiveSessions();
-    } catch (err) {
-        console.error("Session restore error:", err.message);
-    }
+    // Sessions are NOT auto-restored on startup.
+    // Instances are loaded into RAM only when a user explicitly connects them via the dashboard.
+    // This conserves server resources (each instance spawns a Chromium browser process).
+    // Users can reconnect without re-scanning the QR code — their saved sessions are on disk.
+    console.log("Server ready. Connect instances from the dashboard to activate them.");
 });

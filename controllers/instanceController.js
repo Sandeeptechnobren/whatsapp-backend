@@ -6,6 +6,99 @@ const axios   = require("axios");
 const path    = require("path");
 const fs      = require("fs").promises;
 
+/* ────────────────────────────────────────────────────────────────────────────
+   Groq AI — used for auto-reply
+   API key and model are stored per-admin in the DB (dynamic, changeable from UI).
+   process.env.GROQ_API_KEY / GROQ_MODEL serve as server-wide fallbacks.
+   ──────────────────────────────────────────────────────────────────────────── */
+const Groq = require("groq-sdk");
+
+/* ── Conversation history helpers ────────────────────────────────────────── */
+
+/** Fetch the last `limit` messages for a chat, oldest-first (for Groq context). */
+async function getConversationHistory(instanceDbId, chatId, limit = 20) {
+    try {
+        const [rows] = await db.query(
+            `SELECT role, content
+               FROM messages
+              WHERE instance_id = ? AND chat_id = ?
+              ORDER BY created_at DESC
+              LIMIT ?`,
+            [instanceDbId, chatId, limit]
+        );
+        return rows.reverse(); // oldest → newest
+    } catch (err) {
+        console.error("[Memory] fetch error:", err.message);
+        return [];
+    }
+}
+
+/** Persist a single message (user or assistant) to the messages table. */
+async function saveMessage(instanceDbId, chatId, role, content, waTimestamp) {
+    try {
+        await db.query(
+            `INSERT INTO messages (instance_id, chat_id, role, content, wa_timestamp)
+             VALUES (?, ?, ?, ?, ?)`,
+            [instanceDbId, chatId, role, content, waTimestamp || null]
+        );
+    } catch (err) {
+        console.error("[Memory] save error:", err.message);
+    }
+}
+
+/* ── Groq reply with full conversation context ───────────────────────────── */
+
+/**
+ * @param {string|null} apiKey       - admin's Groq key (falls back to .env)
+ * @param {string|null} model        - Groq model name
+ * @param {string}      systemPrompt - AI persona / instructions
+ * @param {Array}       history      - [{role:'user'|'assistant', content:string}, ...]
+ * @param {string}      userMessage  - the latest incoming message
+ */
+async function generateGroqReply(apiKey, model, systemPrompt, history, userMessage) {
+    const key   = apiKey  || process.env.GROQ_API_KEY;
+    const mdl   = model   || process.env.GROQ_MODEL || "llama-3.3-70b-versatile";
+    const sysPr = systemPrompt?.trim() ||
+        "You are a helpful WhatsApp assistant. Reply concisely and professionally.";
+
+    if (!key) {
+        console.warn("[Groq] No API key — configure it in AI Settings.");
+        return null;
+    }
+
+    try {
+        const groq = new Groq({ apiKey: key });
+
+        const messages = [
+            { role: "system", content: sysPr },
+            ...history,                           // previous turns
+            { role: "user",   content: userMessage }, // current message
+        ];
+
+        const completion = await groq.chat.completions.create({
+            model: mdl,
+            messages,
+            max_tokens: 512,
+            temperature: 0.7,
+        });
+        return completion.choices[0]?.message?.content?.trim() || null;
+    } catch (err) {
+        console.error("[Groq] Error generating reply:", err.message);
+        return null;
+    }
+}
+
+/* ────────────────────────────────────────────────────────────────────────────
+   In-memory instance store
+   Structure: instances[instanceName] = {
+     client, ready, qr,
+     instanceDbId,                              ← instances.id PK (for messages FK)
+     adminId,
+     webhookUrl,
+     autoReply:    { enabled, scope, prompt },
+     groqSettings: { apiKey, model }
+   }
+   ──────────────────────────────────────────────────────────────────────────── */
 let instances = {};
 
 async function getAdminFromToken(token) {
@@ -32,29 +125,25 @@ async function forwardToWebhook(webhookUrl, event, instanceName, data) {
 async function safeDestroyClient(client, instanceName) {
     try { await client.destroy(); } catch (_) { /* ignore */ }
 
-    // Step 2: wait for Windows to release file handles on Chromium's SQLite files
     await new Promise(r => setTimeout(r, 2000));
 
-    // Step 3: retry deleting session dir with backoff (handles Windows EBUSY)
     const sessionDir = path.join(process.cwd(), ".wwebjs_auth", `session-${instanceName}`);
     for (let attempt = 1; attempt <= 5; attempt++) {
         try {
             await fs.rm(sessionDir, { recursive: true, force: true });
-            return; // success
+            return;
         } catch (_) {
             if (attempt < 5) await new Promise(r => setTimeout(r, attempt * 1000));
         }
     }
-    console.warn(`[${instanceName}] Could not fully clean session dir — will be cleaned on next startup`);
+    console.warn(`[${instanceName}] Could not fully clean session dir`);
 }
 
 /** Attach all standard event handlers to a WhatsApp client */
 function attachClientEvents(client, instanceName, adminId) {
     client.on("ready", async () => {
         try {
-            if (!instances[instanceName]) return; // guard: instance may have been removed
-            // whatsapp-web.js can fire 'ready' multiple times during injection retries —
-            // only process the first one
+            if (!instances[instanceName]) return;
             if (instances[instanceName].ready) return;
             instances[instanceName].ready = true;
             instances[instanceName].qr = null;
@@ -70,17 +159,10 @@ function attachClientEvents(client, instanceName, adminId) {
 
     client.on("disconnected", async (reason) => {
         console.log(`[${instanceName}] Disconnected: ${reason}`);
-        // Guard: if already cleaned up (e.g. logoutInstance deleted the entry first),
-        // skip all further processing to prevent duplicate DB writes and false reconnects.
         if (!instances[instanceName]) return;
         const webhookUrl = instances[instanceName]?.webhookUrl || null;
         delete instances[instanceName];
 
-        // BUG FIX 1: Destroy the Chromium browser immediately after removing the instance
-        // from the map. Without this, the process stays alive and keeps a WhatsApp Web
-        // session open. When autoReconnect creates a new client seconds later with the
-        // same LocalAuth session, WhatsApp detects two simultaneous connections and fires
-        // LOGOUT on both — causing the "Connected and ready → Disconnected: LOGOUT" loop.
         client.destroy().catch(() => {});
 
         try {
@@ -90,18 +172,13 @@ function attachClientEvents(client, instanceName, adminId) {
             );
         } catch (err) { console.error(`[${instanceName}] disconnect DB error:`, err.message); }
 
-        // BUG FIX 2: When WhatsApp fires LOGOUT the session has been revoked on the
-        // server side (user removed the linked device from their phone, or too many
-        // devices). Delete the local session directory so restoreActiveSessions doesn't
-        // reload a dead session on the next restart, which would produce another instant
-        // "ready → LOGOUT" cycle.
         if (reason === "LOGOUT") {
             const sessionDir = path.join(process.cwd(), ".wwebjs_auth", `session-${instanceName}`);
             fs.rm(sessionDir, { recursive: true, force: true }).catch(() => {});
-            console.log(`[${instanceName}] Session directory removed (LOGOUT — session revoked)`);
+            console.log(`[${instanceName}] Session directory removed (LOGOUT)`);
         }
 
-        // Auto-reconnect unless the user explicitly logged out or there's a conflict
+        // Auto-reconnect unless explicit logout or conflict
         if (reason !== "LOGOUT" && reason !== "CONFLICT") {
             console.log(`[${instanceName}] Will auto-reconnect in 5s (reason: ${reason})`);
             setTimeout(() => autoReconnect(instanceName, adminId, webhookUrl), 5000);
@@ -110,18 +187,61 @@ function attachClientEvents(client, instanceName, adminId) {
 
     client.on("message", async (msg) => {
         try {
-            const wh = instances[instanceName]?.webhookUrl;
+            const inst = instances[instanceName];
+            if (!inst) return;
+
+            // Forward to webhook
+            const wh = inst.webhookUrl;
             if (wh) {
                 await forwardToWebhook(wh, "message", instanceName, {
-                    from: msg.from,
-                    to: msg.to,
-                    body: msg.body,
-                    type: msg.type,
+                    from:      msg.from,
+                    to:        msg.to,
+                    body:      msg.body,
+                    type:      msg.type,
                     timestamp: msg.timestamp,
-                    isGroup: msg.from.endsWith("@g.us"),
-                    author: msg.author || null,
-                    hasMedia: msg.hasMedia,
+                    isGroup:   msg.from.endsWith("@g.us"),
+                    author:    msg.author || null,
+                    hasMedia:  msg.hasMedia,
                 });
+            }
+
+            // ── Groq auto-reply with conversation memory ───────────────────────
+            const ar = inst.autoReply;
+            if (ar?.enabled && msg.body && !msg.fromMe) {
+                const isGroup  = msg.from.endsWith("@g.us");
+                const scope    = ar.scope || "private";
+                const shouldReply =
+                    scope === "all" ||
+                    (scope === "private" && !isGroup) ||
+                    (scope === "groups"  && isGroup);
+
+                if (shouldReply) {
+                    const chatId      = msg.from;          // unique per conversation
+                    const instanceDbId = inst.instanceDbId;
+
+                    // 1. Persist the incoming user message
+                    await saveMessage(instanceDbId, chatId, "user", msg.body, msg.timestamp);
+
+                    // 2. Load previous conversation turns for context
+                    const history = await getConversationHistory(instanceDbId, chatId, 20);
+                    // Remove the message we just saved (last entry) — it will be
+                    // passed separately as the final "user" turn in generateGroqReply
+                    if (history.length > 0) history.pop();
+
+                    // 3. Generate reply using full context
+                    const gs    = inst.groqSettings || {};
+                    const reply = await generateGroqReply(
+                        gs.apiKey, gs.model, ar.prompt, history, msg.body
+                    );
+
+                    if (reply) {
+                        // 4. Send the reply
+                        await msg.reply(reply);
+                        // 5. Persist the assistant reply
+                        await saveMessage(instanceDbId, chatId, "assistant", reply, null);
+                        console.log(`[${instanceName}] Auto-replied to ${chatId} (history: ${history.length} turns)`);
+                    }
+                }
             }
         } catch (err) { console.error(`[${instanceName}] message event error:`, err.message); }
     });
@@ -131,8 +251,6 @@ function attachClientEvents(client, instanceName, adminId) {
         if (wh) forwardToWebhook(wh, "message.ack", instanceName, { id: msg.id, ack });
     });
 
-    // Keep instances[name].qr up to date on every QR rotation so getQrPng always
-    // returns the latest code — critical for restored/auto-reconnected sessions
     client.on("qr", async (qr) => {
         if (!instances[instanceName]) return;
         instances[instanceName].qr = qr;
@@ -147,7 +265,6 @@ function attachClientEvents(client, instanceName, adminId) {
     client.on("auth_failure", async (msg) => {
         console.error(`[${instanceName}] Auth failure:`, msg);
         if (instances[instanceName]) delete instances[instanceName];
-        // Destroy browser and remove the invalid session so it is not restored on restart
         client.destroy().catch(() => {});
         const sessionDir = path.join(process.cwd(), ".wwebjs_auth", `session-${instanceName}`);
         fs.rm(sessionDir, { recursive: true, force: true }).catch(() => {});
@@ -167,15 +284,10 @@ function createClient(instanceName) {
             "--disable-gpu",
             "--no-first-run",
             "--no-zygote",
-            // Prevent WhatsApp Web from detecting headless Chrome as an automated
-            // browser, which causes it to revoke the session immediately after
-            // authentication (ready → LOGOUT within seconds).
             "--disable-blink-features=AutomationControlled",
         ],
     };
 
-    // On Linux servers (Render, Railway, etc.) use the system-installed Chromium
-    // so Puppeteer doesn't try to download its own bundled Chrome binary.
     if (process.platform === "linux") {
         const chromePaths = [
             "/usr/bin/chromium-browser",
@@ -184,60 +296,92 @@ function createClient(instanceName) {
             "/usr/bin/google-chrome-stable",
         ];
         const fs_sync = require("fs");
-        const systemChrome = chromePaths.find(p => { try { fs_sync.accessSync(p); return true; } catch { return false; } });
+        const systemChrome = chromePaths.find(p => {
+            try { fs_sync.accessSync(p); return true; } catch { return false; }
+        });
         if (systemChrome) puppeteerConfig.executablePath = systemChrome;
     }
 
     const client = new Client({
         authStrategy: new LocalAuth({ clientId: instanceName }),
         puppeteer: puppeteerConfig,
-        // Pin to a locally cached WhatsApp Web version rather than always fetching
-        // the latest. WhatsApp pushes updates frequently and newer versions can be
-        // incompatible with the current whatsapp-web.js injection until a library
-        // patch is released. With 'local', once a working version is cached it stays
-        // pinned; delete .wwebjs_cache to force a fresh download.
-        webVersionCache: {
-            type: "local",
-            path: "./.wwebjs_cache",
-        },
+        webVersionCache: { type: "local", path: "./.wwebjs_cache" },
     });
 
-    // LocalAuth.logout() calls fs.promises.rm() while Chromium still holds file handles
-    // open on Windows → EBUSY. This wrapper swallows that error so it never becomes an
-    // unhandledRejection. The original function is still called so fresh-session cleanup
-    // works when it can; safeDestroyClient handles the retry after the browser closes.
     const _origLogout = client.authStrategy.logout.bind(client.authStrategy);
     client.authStrategy.logout = async () => { try { await _origLogout(); } catch (_) {} };
 
     return client;
 }
 
-// Tracks instances currently in the middle of an auto-reconnect attempt
 const reconnecting = new Set();
+
+/** Fetch admin's Groq settings from DB (returns {apiKey, model}) */
+async function getAdminGroqSettings(adminId) {
+    try {
+        const [rows] = await db.query(
+            "SELECT groq_api_key, groq_model FROM admins WHERE id=?",
+            [adminId]
+        );
+        if (!rows.length) return { apiKey: null, model: null };
+        return {
+            apiKey: rows[0].groq_api_key || null,
+            model:  rows[0].groq_model   || null,
+        };
+    } catch { return { apiKey: null, model: null }; }
+}
+
+/**
+ * After an admin updates their Groq settings, call this to immediately sync
+ * all their running instances in memory — no restart required.
+ */
+function syncGroqSettingsInMemory(adminId, groqSettings) {
+    for (const name of Object.keys(instances)) {
+        if (instances[name].adminId === adminId) {
+            instances[name].groqSettings = groqSettings;
+        }
+    }
+}
+
+exports.syncGroqSettingsInMemory = syncGroqSettingsInMemory;
 
 /** Auto-reconnect an instance after an unexpected disconnect */
 async function autoReconnect(instanceName, adminId, webhookUrl) {
-    if (instances[instanceName]) return; // already back online
-    if (reconnecting.has(instanceName)) return; // another reconnect is already in progress
+    if (instances[instanceName]) return;
+    if (reconnecting.has(instanceName)) return;
 
-    // Check session dir exists before trying to reconnect
     const sessionDir = path.join(process.cwd(), ".wwebjs_auth", `session-${instanceName}`);
-    try { await fs.access(sessionDir); } catch { return; } // session was deleted (explicit logout)
+    try { await fs.access(sessionDir); } catch { return; }
 
-    // Verify instance still exists in DB and isn't deleted
+    let dbRow = null;
     try {
         const [rows] = await db.query(
-            "SELECT id FROM instances WHERE name=? AND admin_id=? AND deleted_at IS NULL",
+            "SELECT id, webhook_url, auto_reply_enabled, auto_reply_scope, auto_reply_prompt FROM instances WHERE name=? AND admin_id=? AND deleted_at IS NULL",
             [instanceName, adminId]
         );
         if (!rows.length) return;
+        dbRow = rows[0];
     } catch { return; }
 
     reconnecting.add(instanceName);
     console.log(`[${instanceName}] Auto-reconnecting...`);
+    const groqSettings = await getAdminGroqSettings(adminId);
     try {
         const client = createClient(instanceName);
-        instances[instanceName] = { client, ready: false, qr: null, webhookUrl: webhookUrl || null };
+        instances[instanceName] = {
+            client,
+            ready: false,
+            qr: null,
+            instanceDbId: dbRow.id,
+            adminId,
+            webhookUrl: webhookUrl || dbRow.webhook_url || null,
+            autoReply: {
+                enabled: !!dbRow.auto_reply_enabled,
+                scope:   dbRow.auto_reply_scope   || "private",
+                prompt:  dbRow.auto_reply_prompt  || "",
+            },
+            groqSettings,
+        };
         attachClientEvents(client, instanceName, adminId);
         client.initialize().catch(err => {
             console.error(`[${instanceName}] Auto-reconnect init error:`, err.message);
@@ -248,38 +392,52 @@ async function autoReconnect(instanceName, adminId, webhookUrl) {
     }
 }
 
-/**
- * On server startup: restore WhatsApp sessions for all instances that have a
- * saved LocalAuth session directory. This keeps users logged in across restarts.
- */
-async function restoreActiveSessions() {
+exports.restoreActiveSessions = async function restoreActiveSessions() {
+    // NOTE: This function is intentionally NOT called on startup.
+    // Instances are loaded into RAM only when the user explicitly connects them.
+    // This saves resources — each instance runs a Chromium browser process.
+    // To restore all saved sessions manually, call this function directly.
     const baseDir = path.join(process.cwd(), ".wwebjs_auth");
     let entries;
     try {
         entries = await fs.readdir(baseDir);
     } catch {
-        return; // no session dir yet — nothing to restore
+        return;
     }
 
     for (const entry of entries) {
         if (!entry.startsWith("session-")) continue;
         const instanceName = entry.slice("session-".length);
-        if (instances[instanceName]) continue; // already initializing
+        if (instances[instanceName]) continue;
 
         try {
             const [rows] = await db.query(
-                "SELECT admin_id, webhook_url FROM instances WHERE name=? AND deleted_at IS NULL LIMIT 1",
+                "SELECT id, admin_id, webhook_url, auto_reply_enabled, auto_reply_scope, auto_reply_prompt FROM instances WHERE name=? AND deleted_at IS NULL LIMIT 1",
                 [instanceName]
             );
             if (!rows.length) continue;
 
-            const { admin_id, webhook_url } = rows[0];
+            const row = rows[0];
             console.log(`[${instanceName}] Restoring saved session...`);
 
+            const groqSettings = await getAdminGroqSettings(row.admin_id);
             const client = createClient(instanceName);
-            instances[instanceName] = { client, ready: false, qr: null, webhookUrl: webhook_url || null };
+            instances[instanceName] = {
+                client,
+                ready: false,
+                qr: null,
+                instanceDbId: row.id,
+                adminId: row.admin_id,
+                webhookUrl: row.webhook_url || null,
+                autoReply: {
+                    enabled: !!row.auto_reply_enabled,
+                    scope:   row.auto_reply_scope  || "private",
+                    prompt:  row.auto_reply_prompt || "",
+                },
+                groqSettings,
+            };
 
-            attachClientEvents(client, instanceName, admin_id);
+            attachClientEvents(client, instanceName, row.admin_id);
             client.initialize().catch(err => {
                 console.error(`[${instanceName}] Session restore init error:`, err.message);
                 delete instances[instanceName];
@@ -288,9 +446,7 @@ async function restoreActiveSessions() {
             console.error(`[${instanceName}] Session restore error:`, err.message);
         }
     }
-}
-
-exports.restoreActiveSessions = restoreActiveSessions;
+};
 
 /* ============================================================
    INSTANCE MANAGEMENT
@@ -305,7 +461,7 @@ exports.createInstance = async (req, res) => {
 
         const instanceToken = crypto.randomBytes(12).toString("hex");
         const trialEndsAt = new Date();
-        trialEndsAt.setDate(trialEndsAt.getDate() + 6); // 6 days free trial
+        trialEndsAt.setDate(trialEndsAt.getDate() + 6);
 
         const [result] = await db.query(
             `INSERT INTO instances (admin_id, name, token, status, trial_ends_at, plan, uuid)
@@ -340,7 +496,8 @@ exports.listInstances = async (req, res) => {
         if (!admin) return res.status(401).json({ error: "Invalid token" });
 
         const [rows] = await db.query(
-            `SELECT id, name, token, status, uuid, trial_ends_at, plan, plan_expires_at, last_seen
+            `SELECT id, name, token, status, uuid, trial_ends_at, plan, plan_expires_at, last_seen,
+                    auto_reply_enabled, auto_reply_scope
              FROM instances WHERE admin_id=? AND deleted_at IS NULL ORDER BY id DESC`,
             [admin.id]
         );
@@ -353,14 +510,15 @@ exports.listInstances = async (req, res) => {
 
 exports.getInstanceDetails = async (req, res) => {
     try {
-        const { token } = req.body;
+        const token = req.query.token || req.body?.token;
         const instanceId = req.params.uuid;
 
         const admin = await getAdminFromToken(token);
         if (!admin) return res.status(401).json({ error: "Invalid token" });
 
         const [rows] = await db.query(
-            `SELECT id, name, token, status, uuid, trial_ends_at, plan, plan_expires_at, webhook_url, last_seen
+            `SELECT id, name, token, status, uuid, trial_ends_at, plan, plan_expires_at,
+                    webhook_url, last_seen, auto_reply_enabled, auto_reply_scope, auto_reply_prompt
              FROM instances WHERE admin_id=? AND uuid=? AND deleted_at IS NULL`,
             [admin.id, instanceId]
         );
@@ -394,9 +552,23 @@ exports.connectInstance = async (req, res) => {
             return res.json({ success: true, status: "initializing" });
         }
 
-        // Start client initialization in the background — respond immediately
+        const row = rows[0];
+        const groqSettings = await getAdminGroqSettings(admin.id);
         const client = createClient(instance_name);
-        instances[instance_name] = { client, ready: false, qr: null, webhookUrl: rows[0].webhook_url || null };
+        instances[instance_name] = {
+            client,
+            ready: false,
+            qr: null,
+            instanceDbId: row.id,
+            adminId: admin.id,
+            webhookUrl: row.webhook_url || null,
+            autoReply: {
+                enabled: !!row.auto_reply_enabled,
+                scope:   row.auto_reply_scope  || "private",
+                prompt:  row.auto_reply_prompt || "",
+            },
+            groqSettings,
+        };
         attachClientEvents(client, instance_name, admin.id);
         client.initialize().catch(err => {
             console.error(`[${instance_name}] init error:`, err.message);
@@ -425,17 +597,23 @@ exports.startInstance = async (req, res) => {
         if (!rows.length) return res.status(404).json({ error: "Instance not found" });
         if (instances[instance_name]) return res.status(400).json({ message: "Already running" });
 
+        const row = rows[0];
+        const groqSettings = await getAdminGroqSettings(admin.id);
         const client = createClient(instance_name);
-        instances[instance_name] = { client, ready: false, qr: null, webhookUrl: rows[0].webhook_url || null };
-
-        client.on("qr", async (qr) => {
-            if (!instances[instance_name]) return; // guard
-            instances[instance_name].qr = qr;
-            await db.query(
-                "UPDATE instances SET qr_code=?, status='pending' WHERE name=? AND admin_id=?",
-                [qr, instance_name, admin.id]
-            ).catch(() => {});
-        });
+        instances[instance_name] = {
+            client,
+            ready: false,
+            qr: null,
+            instanceDbId: row.id,
+            adminId: admin.id,
+            webhookUrl: row.webhook_url || null,
+            autoReply: {
+                enabled: !!row.auto_reply_enabled,
+                scope:   row.auto_reply_scope  || "private",
+                prompt:  row.auto_reply_prompt || "",
+            },
+            groqSettings,
+        };
 
         attachClientEvents(client, instance_name, admin.id);
         client.initialize().catch(() => {});
@@ -482,17 +660,13 @@ exports.logoutInstance = async (req, res) => {
         const instance = instances[id];
         if (!instance) return res.status(404).json({ error: "Instance not in memory (may be offline)" });
 
-        // Remove from map FIRST so the 'disconnected' event handler sees no entry
-        // and exits immediately — prevents the double-LOGOUT / double-cleanup problem.
         delete instances[id];
 
-        // Send the WhatsApp logout signal via Puppeteer (best-effort, 3s timeout).
         const signalPromise = (instance.client.pupPage?.evaluate(
             () => window.Store?.AppState?.logout?.()
         ) ?? Promise.resolve()).catch(() => {});
         await Promise.race([signalPromise, new Promise(resolve => setTimeout(resolve, 3000))]);
 
-        // Destroy browser + clean session files with retry backoff (safe on Windows)
         await safeDestroyClient(instance.client, id);
 
         await db.query(
@@ -571,12 +745,12 @@ exports.getStatus = async (req, res) => {
         const admin = await getAdminFromToken(token);
         if (!admin) return res.status(401).json({ error: "Invalid token" });
 
-        // Check in-memory first
         const instance = instances[id];
 
-        // Also fetch DB row for plan info
         const [rows] = await db.query(
-            "SELECT status, webhook_url, trial_ends_at, plan, plan_expires_at FROM instances WHERE name=? AND admin_id=? AND deleted_at IS NULL",
+            `SELECT status, webhook_url, trial_ends_at, plan, plan_expires_at,
+                    auto_reply_enabled, auto_reply_scope
+             FROM instances WHERE name=? AND admin_id=? AND deleted_at IS NULL`,
             [id, admin.id]
         );
 
@@ -584,14 +758,76 @@ exports.getStatus = async (req, res) => {
 
         return res.json({
             id,
-            ready: instance ? instance.ready : false,
-            hasQr: instance ? !!instance.qr : false,
-            status: instance?.ready ? "ready" : (rows[0].status || "pending"),
+            ready:      instance ? instance.ready : false,
+            hasQr:      instance ? !!instance.qr : false,
+            status:     instance?.ready ? "ready" : (rows[0].status || "pending"),
             webhookUrl: instance?.webhookUrl || rows[0].webhook_url || null,
-            plan: rows[0].plan,
-            trial_ends_at: rows[0].trial_ends_at,
-            plan_expires_at: rows[0].plan_expires_at,
+            plan:              rows[0].plan,
+            trial_ends_at:     rows[0].trial_ends_at,
+            plan_expires_at:   rows[0].plan_expires_at,
+            auto_reply_enabled: !!rows[0].auto_reply_enabled,
+            auto_reply_scope:   rows[0].auto_reply_scope || "private",
         });
+    } catch (err) {
+        return res.status(500).json({ error: err.message });
+    }
+};
+
+/* ============================================================
+   AUTO-REPLY SETTINGS
+   ============================================================ */
+
+exports.getAutoReplySettings = async (req, res) => {
+    const token = req.body?.token || req.query.token;
+    const id    = req.params.id;
+
+    try {
+        const admin = await getAdminFromToken(token);
+        if (!admin) return res.status(401).json({ error: "Invalid token" });
+
+        const [rows] = await db.query(
+            "SELECT auto_reply_enabled, auto_reply_scope, auto_reply_prompt FROM instances WHERE name=? AND admin_id=? AND deleted_at IS NULL",
+            [id, admin.id]
+        );
+        if (!rows.length) return res.status(404).json({ error: "Instance not found" });
+
+        return res.json({
+            success: true,
+            enabled: !!rows[0].auto_reply_enabled,
+            scope:   rows[0].auto_reply_scope  || "private",
+            prompt:  rows[0].auto_reply_prompt || "",
+        });
+    } catch (err) {
+        return res.status(500).json({ error: err.message });
+    }
+};
+
+exports.updateAutoReplySettings = async (req, res) => {
+    const { token, enabled, scope, prompt } = req.body;
+    const id = req.params.id;
+
+    try {
+        const admin = await getAdminFromToken(token);
+        if (!admin) return res.status(401).json({ error: "Invalid token" });
+
+        const validScopes = ["private", "groups", "all"];
+        const safeScope   = validScopes.includes(scope) ? scope : "private";
+
+        await db.query(
+            "UPDATE instances SET auto_reply_enabled=?, auto_reply_scope=?, auto_reply_prompt=? WHERE name=? AND admin_id=? AND deleted_at IS NULL",
+            [enabled ? 1 : 0, safeScope, prompt || null, id, admin.id]
+        );
+
+        // Sync in-memory state immediately
+        if (instances[id]) {
+            instances[id].autoReply = {
+                enabled: !!enabled,
+                scope:   safeScope,
+                prompt:  prompt || "",
+            };
+        }
+
+        return res.json({ success: true });
     } catch (err) {
         return res.status(500).json({ error: err.message });
     }
@@ -611,7 +847,6 @@ function getReadyClient(id) {
 exports.sendMessage = async (req, res) => {
     const { token, number, message } = req.body;
     const id = req.params.id;
-
     try {
         const admin = await getAdminFromToken(token);
         if (!admin) return res.status(401).json({ error: "Invalid token" });
@@ -643,7 +878,6 @@ exports.sendMedia = async (req, res) => {
 
         const media = new MessageMedia(mimetype, base64, filename || "file");
         const chatId = number.includes("@") ? number : `${number}@c.us`;
-
         const sentMsg = await client.sendMessage(chatId, media, { caption: caption || "" });
 
         return res.json({ success: true, messageId: sentMsg.id._serialized });
@@ -921,8 +1155,8 @@ exports.getAccountInfo = async (req, res) => {
         return res.json({
             success: true,
             data: {
-                wid: info.wid._serialized,
-                phone: info.wid.user,
+                wid:      info.wid._serialized,
+                phone:    info.wid.user,
                 platform: info.platform,
                 pushname: info.pushname,
             },
@@ -981,11 +1215,7 @@ exports.createGroup = async (req, res) => {
         const participantIds = participants.map(p => p.includes("@") ? p : `${p}@c.us`);
         const group = await client.createGroup(name, participantIds);
 
-        return res.json({
-            success: true,
-            groupId: group.gid._serialized,
-            name,
-        });
+        return res.json({ success: true, groupId: group.gid._serialized, name });
     } catch (err) {
         return res.status(500).json({ error: err.message });
     }

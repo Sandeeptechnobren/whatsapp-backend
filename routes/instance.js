@@ -18,6 +18,10 @@ router.post("/status/:id",               ctrl.getStatus);
 router.get( "/qr/:id",                   ctrl.getQr);
 router.get( "/qrpng/:id",               ctrl.getQrPng);
 
+/* ── Auto-reply settings ── */
+router.post("/auto-reply/:id",           ctrl.getAutoReplySettings);
+router.put( "/auto-reply/:id",           ctrl.updateAutoReplySettings);
+
 /* ── Messaging (trial-checked) ── */
 router.post("/send/:id",                 trialCheck, ctrl.sendMessage);
 router.post("/send-media/:id",           trialCheck, ctrl.sendMedia);
